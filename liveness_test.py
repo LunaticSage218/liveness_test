@@ -13,15 +13,20 @@ Two sub-commands:
   test    Read the board at the current temperature and run the liveness test
           against tt1.csv.
             python liveness_test.py test --port /dev/ttyUSB0 --temp 23
+            python liveness_test.py test --port COM3 --temp 23 --test 1 --pairs 200
             python liveness_test.py test --port COM3 --temp 23 --reps 100 \
                 --pairs-per-cat 40 --seed 7 --raw-out raw.csv --report rep.json
 
-Liveness test-2 (whitepaper §3.1):
-  * TT1 rows are split into three populations relative to T:
-      at     pairs crossing in T's 5°C bucket
-      close  pairs crossing one bucket (±5°C) away
-      far    pairs crossing ≥10°C away
-  * A separate random draw is taken from each population.
+Liveness tests (whitepaper §3.1):
+  * Pairs are split by the distance of their exact crossing temperature
+    from T (edges set by BANDS or --bands, default 1,5,10):
+      at     ≤1°C
+      close  1–5°C
+      far    5–10°C       (pairs >10°C away are unused)
+  * --test 1: one random number picks --pairs pairs from all of TT1; they are
+              then sorted into the three populations.
+    --test 2: a separate random number per population picks --pairs-per-cat
+              pairs from each (default).
   * The board is read --reps times in the zmax orientation. Each pair gives a
     response bit per read: 0 if first cell < second cell, else 1.
   * Error rate = fraction of bits that differ from the TT1 prediction at T.
@@ -47,6 +52,11 @@ AXES = ["x", "y", "z"]
 AXIS_IDX = {a: i for i, a in enumerate(AXES)}
 T_LOW, T_HIGH = 10, 60            # enrollment endpoints actually measured
 BUCKET = 5                        # TT1 row spacing, °C
+
+# Liveness categories: max |crossing_temp - T| in °C for (at, close, far).
+# at: d <= 1 | close: 1 < d <= 5 | far: 5 < d <= 10 | beyond 10: unused.
+# Override per run with --bands AT,CLOSE,FAR (e.g. --bands 1,5,100).
+BANDS = (1.0, 5.0, 10.0)
 T_MIN, T_MAX = 0, 70              # TT1 row range, °C
 TT1_COLS = ["temperature", "crossing_temp", "sensor1", "axis1",
             "sensor2", "axis2", "dir", "value"]
@@ -198,24 +208,44 @@ def cmd_enroll(args):
 # Liveness test
 # ══════════════════════════════════════════════════════════════════════════════
 
-def categorize(tt1, T):
-    tb = to_bucket(T)
-    dist = (tt1["temperature"] - tb).abs()
-    return tb, {"at":    tt1[dist == 0],
-                "close": tt1[dist == BUCKET],
-                "far":   tt1[dist >= 2 * BUCKET]}
+def categorize(tt1, T, bands=BANDS):
+    """
+    Split pairs by |crossing_temp - T| using the band edges (at, close, far):
+      at     d <= at
+      close  at < d <= close
+      far    close < d <= far        (pairs beyond far are unused)
+    """
+    at, close, far = bands
+    d = (tt1["crossing_temp"] - T).abs()
+    return {"at":    tt1[d <= at],
+            "close": tt1[(d > at) & (d <= close)],
+            "far":   tt1[(d > close) & (d <= far)]}
 
 
-def draw(cats, n, rng):
-    """Test-2: an independent random draw from each population."""
-    out = {}
-    for k, df in cats.items():
-        if n is None or n >= len(df):
-            out[k] = df.reset_index(drop=True)
-        else:
-            out[k] = df.iloc[rng.choice(len(df), n, replace=False)] \
-                       .reset_index(drop=True)
-    return out
+def random_streams(seed, k):
+    """
+    k independent random streams from one seed. With seed=None the seed comes
+    from OS entropy; it is returned so the run can be reproduced with --seed.
+    """
+    ss = np.random.SeedSequence(seed)
+    return ss.entropy, [np.random.default_rng(c) for c in ss.spawn(k)]
+
+
+def subsample(df, n, rng):
+    if n is None or n >= len(df):
+        return df.reset_index(drop=True)
+    return df.iloc[rng.choice(len(df), n, replace=False)].reset_index(drop=True)
+
+
+def draw_test1(tt1, T, n, rng, bands):
+    """Test-1: one random number picks n pairs from all of TT1; the picked
+    pairs are then split into at / close / far relative to T."""
+    return categorize(subsample(tt1, n, rng), T, bands)
+
+
+def draw_test2(cats, n, rngs):
+    """Test-2: a separate random number (stream) per population."""
+    return {k: subsample(df, n, r) for (k, df), r in zip(cats.items(), rngs)}
 
 
 def expected_bits(df, T):
@@ -323,16 +353,41 @@ def cmd_test(args):
         print(rb.warn(f"  [!] T={T}°C is outside the enrolled range "
                       f"{T_LOW}–{T_HIGH}°C; predictions are extrapolated."))
 
-    tb, cats = categorize(tt1, T)
-    rng = np.random.default_rng(args.seed)
-    picked = draw(cats, args.pairs_per_cat, rng)
+    if args.test == 1 and args.pairs_per_cat is not None:
+        print(rb.err("  [!] --pairs-per-cat is for --test 2; use --pairs with --test 1\n"))
+        return 2
+    if args.test == 2 and args.pairs is not None:
+        print(rb.err("  [!] --pairs is for --test 1; use --pairs-per-cat with --test 2\n"))
+        return 2
+
+    bands = tuple(args.bands)
+    if not (0 < bands[0] < bands[1] < bands[2]):
+        print(rb.err(f"  [!] --bands must be increasing positive values, got {bands}\n"))
+        return 2
+
+    cats = categorize(tt1, T, bands)
+    if args.test == 1:
+        seed, (rng,) = random_streams(args.seed, 1)
+        picked = draw_test1(tt1, T, args.pairs, rng, bands)
+        n_drawn = len(tt1) if args.pairs is None else min(args.pairs, len(tt1))
+        n_used = sum(len(d) for d in picked.values())
+        drawn = (f"{n_drawn}/{len(tt1)} from one random number "
+                 f"({n_used} within ±{bands[2]:g}°C used)")
+    else:
+        seed, rngs = random_streams(args.seed, 3)
+        picked = draw_test2(cats, args.pairs_per_cat, rngs)
+        drawn = "one random number per category"
 
     print()
-    print(rb.bold(rb.head("  TEC liveness test-2")))
-    print(f"  {rb.dim('T         :')} {T}°C  {rb.dim(f'(TT1 row {tb}°C)')}")
+    print(rb.bold(rb.head(f"  TEC liveness test-{args.test}")))
+    print(f"  {rb.dim('T         :')} {T}°C")
+    print(f"  {rb.dim('bands     :')} at ≤{bands[0]:g}   close ≤{bands[1]:g}   "
+          f"far ≤{bands[2]:g} °C from T")
+    print(f"  {rb.dim('draw      :')} {drawn}")
     print(f"  {rb.dim('pairs     :')} at {len(picked['at'])}/{len(cats['at'])}   "
           f"close {len(picked['close'])}/{len(cats['close'])}   "
           f"far {len(picked['far'])}/{len(cats['far'])}")
+    print(f"  {rb.dim('seed      :')} {seed}  {rb.dim('(pass --seed to reproduce)')}")
     print(f"  {rb.dim('reps      :')} {args.reps}")
     print()
 
@@ -405,8 +460,9 @@ def cmd_test(args):
     if args.report:
         with open(args.report, "w") as f:
             json.dump({"timestamp": datetime.now().isoformat(),
-                       "temperature": T, "tt1_row": tb, "reps": args.reps,
-                       "rejected_reads": rejected, "seed": args.seed,
+                       "test": args.test,
+                       "temperature": T, "bands": list(bands), "reps": args.reps,
+                       "rejected_reads": rejected, "seed": str(seed),
                        "results": results,
                        "checks": {n: bool(c) for n, c in checks},
                        "pass": passed}, f, indent=2)
@@ -433,11 +489,21 @@ def main():
     t.add_argument("--tt1", default="tt1.csv")
     t.add_argument("--stats", default="norm_stats.json")
     t.add_argument("--reps", type=int, default=50)
+    t.add_argument("--test", type=int, choices=[1, 2], default=2,
+                   help="1 = single random number picks the pair set (test-1); "
+                        "2 = three random numbers, one per category (test-2, default)")
+    t.add_argument("--pairs", type=int, default=None,
+                   help="test-1: pairs drawn from all of TT1 (default: all)")
     t.add_argument("--pairs-per-cat", type=int, default=None,
-                   help="random pairs drawn per category (default: all)")
-    t.add_argument("--seed", type=int, default=None)
+                   help="test-2: pairs drawn per category (default: all)")
+    t.add_argument("--seed", type=int, default=None,
+                   help="random seed; printed each run so a run can be reproduced")
     t.add_argument("--far-max", type=float, default=0.05,
                    help="max allowed error rate for far pairs (default 0.05)")
+    t.add_argument("--bands", type=lambda s: [float(v) for v in s.split(",")],
+                   default=list(BANDS), metavar="AT,CLOSE,FAR",
+                   help="max °C from T for at/close/far "
+                        f"(default {','.join(f'{b:g}' for b in BANDS)})")
     t.add_argument("--lock-timeout", type=float, default=60,
                    help="seconds to wait for zmax lock")
     t.add_argument("--n_sensors", type=int, default=16)
